@@ -1,0 +1,6 @@
+.tmp/
+bin/
+data/
+dist/
+/influx-to-promblocks
+*.test

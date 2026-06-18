@@ -1,0 +1,36 @@
+services:
+  influxdb:
+    image: influxdb:1.8
+    ports:
+      - "8086:8086"
+    environment:
+      INFLUXDB_HTTP_AUTH_ENABLED: "false"
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address :9001
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+
+  create-bucket:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 minio minio123 >/dev/null 2>&1; do sleep 1; done
+        mc mb --ignore-existing local/thanos
+
+  thanos:
+    image: quay.io/thanos/thanos:v0.40.1
+    profiles: ["tools"]
+    volumes:
+      - ./examples/objstore-minio-compose.yml:/etc/thanos/bucket.yml:ro
+      - ./.tmp/e2e-blocks:/blocks
+    entrypoint: ["/bin/thanos"]
