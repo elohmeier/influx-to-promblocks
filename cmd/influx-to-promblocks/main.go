@@ -77,6 +77,7 @@ func runExport(args []string) error {
 	fs.DurationVar(&cfg.Window, "window", 2*time.Hour, "Influx query and output block window.")
 	fs.DurationVar(&cfg.BlockDuration, "block-duration", 2*time.Hour, "Prometheus TSDB block duration.")
 	fs.IntVar(&cfg.ChunkSize, "chunk-size", 10000, "Influx chunk_size for SELECT queries.")
+	fs.IntVar(&cfg.Parallelism, "parallelism", 1, "Number of windows to copy concurrently.")
 	fs.IntVar(&cfg.MaxFieldsPerQuery, "max-fields-per-query", 20, "Maximum number of fields selected per Influx query.")
 	fs.BoolVar(&cfg.IncludeBooleans, "include-booleans", false, "Copy boolean Influx fields as 0/1 gauges.")
 	fs.StringVar(&cfg.MetricPrefix, "metric-prefix", "", "Prefix to add to generated metric names.")

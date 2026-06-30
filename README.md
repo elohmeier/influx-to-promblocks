@@ -57,10 +57,23 @@ Useful flags:
 
 - `--measurement=cpu`: restricts the copy to one measurement. Repeat for more.
 - `--retention-policy=autogen`: selects an InfluxDB retention policy.
+- `--parallelism=4`: copies multiple time windows concurrently. Start low and increase only while the source InfluxDB remains healthy.
+- `--max-fields-per-query=50`: selects more fields in each Influx query, reducing HTTP round trips when measurements have many numeric fields.
 - `--series-label=tenant=acme`: adds a static label to every generated Prometheus series.
 - `--output-dir=./out/prom-blocks`: sets the Prometheus block output directory.
 - `--include-booleans`: copies boolean fields as 0/1 gauges.
 - `--duplicate-timestamp-policy=first`: drops later samples when multiple Influx nanosecond timestamps collapse into the same Prometheus millisecond.
+
+## Performance tuning
+
+Most export time is usually spent waiting for Influx `SELECT` queries. Block writes are local and normally much faster.
+
+Useful levers:
+
+- Use the largest `--window` that stays within `--block-duration` and does not make Influx responses too large. For example, `--window=48h --block-duration=48h` halves the number of windows compared with `--window=24h`.
+- Use `--parallelism=N` to copy independent windows concurrently. Values like `2` or `4` are a reasonable starting point for backfills; higher values can overload the source InfluxDB.
+- Increase `--max-fields-per-query` when many fields are exported from the same measurement. This reduces per-window query count, but very wide queries can increase Influx memory use.
+- Tune `--chunk-size` upward only if the client is spending too much time decoding many small chunks and memory use remains acceptable.
 
 ## Mapping
 

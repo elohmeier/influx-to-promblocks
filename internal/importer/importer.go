@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/storage"
@@ -33,6 +34,7 @@ type Config struct {
 	Window                   time.Duration
 	BlockDuration            time.Duration
 	ChunkSize                int
+	Parallelism              int
 	MaxFieldsPerQuery        int
 	IncludeBooleans          bool
 	MetricPrefix             string
@@ -83,7 +85,7 @@ func (i *Importer) Run(ctx context.Context) (Stats, error) {
 		Password:        i.cfg.InfluxPassword,
 		Database:        i.cfg.Database,
 		RetentionPolicy: i.cfg.RetentionPolicy,
-		HTTPClient:      &http.Client{},
+		HTTPClient:      newHTTPClient(i.cfg.Parallelism),
 	}
 
 	start, err := parseTimeArg(i.cfg.Start, time.Now())
@@ -112,24 +114,11 @@ func (i *Importer) Run(ctx context.Context) (Stats, error) {
 	}
 	i.logger.Info("schema discovered", "measurements", len(schema), "numeric_field_groups", countFields(schema))
 
-	var stats Stats
-	for windowStart := start; windowStart.Before(end); windowStart = windowStart.Add(i.cfg.Window) {
-		windowEnd := windowStart.Add(i.cfg.Window)
-		if windowEnd.After(end) {
-			windowEnd = end
-		}
-		windowStats, err := i.copyWindow(ctx, schema, windowStart, windowEnd)
-		if err != nil {
-			return stats, err
-		}
-		stats.Windows++
-		stats.Blocks += windowStats.Blocks
-		stats.Samples += windowStats.Samples
-		if windowStats.Series > stats.Series {
-			stats.Series = windowStats.Series
-		}
+	windows := buildWindows(start, end, i.cfg.Window)
+	if i.cfg.Parallelism == 1 {
+		return i.copyWindowsSerial(ctx, schema, windows)
 	}
-	return stats, nil
+	return i.copyWindowsParallel(ctx, schema, windows)
 }
 
 func (i *Importer) validate() error {
@@ -154,6 +143,12 @@ func (i *Importer) validate() error {
 	if i.cfg.ChunkSize <= 0 {
 		return fmt.Errorf("--chunk-size must be positive")
 	}
+	if i.cfg.Parallelism == 0 {
+		i.cfg.Parallelism = 1
+	}
+	if i.cfg.Parallelism < 0 {
+		return fmt.Errorf("--parallelism must be positive")
+	}
 	if i.cfg.MaxFieldsPerQuery <= 0 {
 		return fmt.Errorf("--max-fields-per-query must be positive")
 	}
@@ -166,6 +161,123 @@ func (i *Importer) validate() error {
 		return fmt.Errorf("--output-dir is required")
 	}
 	return nil
+}
+
+type windowRange struct {
+	start time.Time
+	end   time.Time
+}
+
+type windowResult struct {
+	stats Stats
+	err   error
+}
+
+func newHTTPClient(parallelism int) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if transport.MaxIdleConns < parallelism {
+		transport.MaxIdleConns = parallelism
+	}
+	if transport.MaxIdleConnsPerHost < parallelism {
+		transport.MaxIdleConnsPerHost = parallelism
+	}
+	return &http.Client{Transport: transport}
+}
+
+func buildWindows(start, end time.Time, window time.Duration) []windowRange {
+	var windows []windowRange
+	for windowStart := start; windowStart.Before(end); windowStart = windowStart.Add(window) {
+		windowEnd := windowStart.Add(window)
+		if windowEnd.After(end) {
+			windowEnd = end
+		}
+		windows = append(windows, windowRange{start: windowStart, end: windowEnd})
+	}
+	return windows
+}
+
+func (i *Importer) copyWindowsSerial(ctx context.Context, schema []measurementSchema, windows []windowRange) (Stats, error) {
+	var stats Stats
+	for _, window := range windows {
+		windowStats, err := i.copyWindow(ctx, schema, window.start, window.end)
+		if err != nil {
+			return stats, err
+		}
+		addWindowStats(&stats, windowStats)
+	}
+	return stats, nil
+}
+
+func (i *Importer) copyWindowsParallel(ctx context.Context, schema []measurementSchema, windows []windowRange) (Stats, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workers := i.cfg.Parallelism
+	if workers > len(windows) {
+		workers = len(windows)
+	}
+	i.logger.Info("copying windows in parallel", "windows", len(windows), "parallelism", workers)
+
+	jobs := make(chan windowRange)
+	results := make(chan windowResult, workers)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for window := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				windowStats, err := i.copyWindow(ctx, schema, window.start, window.end)
+				if err != nil {
+					results <- windowResult{err: fmt.Errorf("copy window %s to %s: %w", window.start.Format(time.RFC3339), window.end.Format(time.RFC3339), err)}
+					cancel()
+					return
+				}
+				results <- windowResult{stats: windowStats}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, window := range windows {
+			select {
+			case jobs <- window:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var stats Stats
+	var firstErr error
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		addWindowStats(&stats, result.stats)
+	}
+	return stats, firstErr
+}
+
+func addWindowStats(total *Stats, window Stats) {
+	total.Windows++
+	total.Blocks += window.Blocks
+	total.Samples += window.Samples
+	if window.Series > total.Series {
+		total.Series = window.Series
+	}
 }
 
 func (i *Importer) discoverSchema(ctx context.Context) ([]measurementSchema, error) {
