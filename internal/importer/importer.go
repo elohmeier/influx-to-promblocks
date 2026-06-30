@@ -227,7 +227,7 @@ func (i *Importer) copyWindow(ctx context.Context, schema []measurementSchema, s
 				fieldByColumn[field.Key] = field
 			}
 			if err := i.influx.Query(ctx, q, true, i.cfg.ChunkSize, func(resp influx.Response) error {
-				return bw.appendResponse(ctx, ms.Name, fieldByColumn, resp, i.cfg.IncludeBooleans)
+				return bw.appendResponse(ms.Name, fieldByColumn, resp, i.cfg.IncludeBooleans)
 			}); err != nil {
 				return Stats{}, err
 			}
@@ -276,7 +276,7 @@ type lastSample struct {
 	v float64
 }
 
-func (b *blockWindow) appendResponse(ctx context.Context, measurement string, fieldByColumn map[string]influx.Field, resp influx.Response, includeBooleans bool) error {
+func (b *blockWindow) appendResponse(measurement string, fieldByColumn map[string]influx.Field, resp influx.Response, includeBooleans bool) error {
 	for _, result := range resp.Results {
 		for _, series := range result.Series {
 			timeIdx := -1
@@ -329,12 +329,6 @@ func (b *blockWindow) appendResponse(ctx context.Context, measurement string, fi
 					b.refs[key] = ref
 					b.samples++
 					b.uncommitted++
-					if b.uncommitted >= 10000 {
-						if err := b.commit(); err != nil {
-							return err
-						}
-						b.app = b.writer.Appender(ctx)
-					}
 				}
 			}
 		}
