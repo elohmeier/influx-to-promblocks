@@ -81,6 +81,7 @@ func runExport(args []string) error {
 	fs.IntVar(&cfg.MaxFieldsPerQuery, "max-fields-per-query", 20, "Maximum number of fields selected per Influx query.")
 	fs.BoolVar(&cfg.IncludeBooleans, "include-booleans", false, "Copy boolean Influx fields as 0/1 gauges.")
 	fs.StringVar(&cfg.MetricPrefix, "metric-prefix", "", "Prefix to add to generated metric names.")
+	fs.StringVar(&cfg.MetricNameMode, "metric-name-mode", importer.MetricNameModeMeasurementField, "Metric naming mode: measurement-field or field.")
 	fs.BoolVar(&cfg.PreserveSourceLabels, "preserve-source-labels", true, "Add influxdb_measurement and influxdb_field labels.")
 	fs.StringVar(&cfg.DuplicateTimestampPolicy, "duplicate-timestamp-policy", "error", "Policy when nanosecond Influx samples collapse to the same Prometheus millisecond: error or first.")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "./blocks", "Directory that will contain generated Prometheus TSDB block directories.")

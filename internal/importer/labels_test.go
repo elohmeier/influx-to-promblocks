@@ -5,6 +5,7 @@ import "testing"
 func TestMetricName(t *testing.T) {
 	tests := []struct {
 		name        string
+		mode        string
 		prefix      string
 		measurement string
 		field       string
@@ -14,10 +15,36 @@ func TestMetricName(t *testing.T) {
 		{name: "non value field appends field", measurement: "cpu", field: "usage idle", want: "cpu_usage_idle"},
 		{name: "invalid leading digit", measurement: "1cpu", field: "value", want: "influx_1cpu"},
 		{name: "prefix", prefix: "legacy_", measurement: "cpu", field: "load-1", want: "legacy_cpu_load_1"},
+		{
+			name:        "field mode uses prometheus-style influx field directly",
+			mode:        MetricNameModeField,
+			measurement: "remote_write_archive",
+			field:       "service_requests_total",
+			want:        "service_requests_total",
+		},
+		{
+			name:        "field mode uses value field directly",
+			mode:        MetricNameModeField,
+			measurement: "cpu",
+			field:       "value",
+			want:        "value",
+		},
+		{
+			name:        "field mode still applies prefix and sanitization",
+			mode:        MetricNameModeField,
+			prefix:      "legacy_",
+			measurement: "remote_write_archive",
+			field:       "9 bad field",
+			want:        "legacy_9_bad_field",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := metricName(tt.prefix, tt.measurement, tt.field); got != tt.want {
+			mode := tt.mode
+			if mode == "" {
+				mode = MetricNameModeMeasurementField
+			}
+			if got := metricName(mode, tt.prefix, tt.measurement, tt.field); got != tt.want {
 				t.Fatalf("metricName() = %q, want %q", got, tt.want)
 			}
 		})

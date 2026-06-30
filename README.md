@@ -61,6 +61,7 @@ Useful flags:
 - `--max-fields-per-query=50`: selects more fields in each Influx query, reducing HTTP round trips when measurements have many numeric fields.
 - `--series-label=tenant=acme`: adds a static label to every generated Prometheus series.
 - `--output-dir=./out/prom-blocks`: sets the Prometheus block output directory.
+- `--metric-name-mode=field`: uses the Influx field name as the Prometheus metric name.
 - `--include-booleans`: copies boolean fields as 0/1 gauges.
 - `--duplicate-timestamp-policy=first`: drops later samples when multiple Influx nanosecond timestamps collapse into the same Prometheus millisecond.
 
@@ -77,10 +78,27 @@ Useful levers:
 
 ## Mapping
 
-Influx measurement and field names become metric names:
+By default, Influx measurement and field names become metric names:
 
 - field `value`: `<measurement>`
 - any other field: `<measurement>_<field>`
+
+Use `--metric-name-mode=field` when the Influx field name already is the
+Prometheus metric name. In that mode every field becomes `<field>`, including a
+field named `value`.
+
+For example, exporting a remote-write archive measurement such as
+`remote_write_archive` can produce live-compatible metric names:
+
+```bash
+influx-to-promblocks export \
+  --measurement=remote_write_archive \
+  --metric-name-mode=field \
+  --preserve-source-labels=false
+```
+
+This writes field `service_requests_total` as metric
+`service_requests_total`, not `remote_write_archive_service_requests_total`.
 
 Invalid Prometheus metric and label characters are replaced with `_`. Original source names are preserved as labels by default:
 

@@ -12,6 +12,11 @@ import (
 
 var labelValueRE = regexp.MustCompile(`^"?([^"]*)"?$`)
 
+const (
+	MetricNameModeMeasurementField = "measurement-field"
+	MetricNameModeField            = "field"
+)
+
 func parseLabelArgs(args []string) (map[string]string, error) {
 	out := make(map[string]string, len(args))
 	for _, arg := range args {
@@ -74,12 +79,24 @@ func buildLabels(metricName, measurement, field string, tags, static map[string]
 	return labels.FromMap(raw)
 }
 
-func metricName(prefix, measurement, field string) string {
-	base := measurement
-	if field != "value" {
+func metricName(mode, prefix, measurement, field string) string {
+	mode = normalizeMetricNameMode(mode)
+	base := field
+	if mode == MetricNameModeMeasurementField {
+		base = measurement
+	}
+	if mode == MetricNameModeMeasurementField && field != "value" {
 		base = measurement + "_" + field
 	}
 	return sanitizeMetricName(prefix + base)
+}
+
+func normalizeMetricNameMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return MetricNameModeMeasurementField
+	}
+	return mode
 }
 
 func sanitizeMetricName(s string) string {

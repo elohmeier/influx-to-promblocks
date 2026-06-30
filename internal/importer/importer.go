@@ -38,6 +38,7 @@ type Config struct {
 	MaxFieldsPerQuery        int
 	IncludeBooleans          bool
 	MetricPrefix             string
+	MetricNameMode           string
 	PreserveSourceLabels     bool
 	DuplicateTimestampPolicy string
 	OutputDir                string
@@ -151,6 +152,12 @@ func (i *Importer) validate() error {
 	}
 	if i.cfg.MaxFieldsPerQuery <= 0 {
 		return fmt.Errorf("--max-fields-per-query must be positive")
+	}
+	i.cfg.MetricNameMode = normalizeMetricNameMode(i.cfg.MetricNameMode)
+	switch i.cfg.MetricNameMode {
+	case MetricNameModeMeasurementField, MetricNameModeField:
+	default:
+		return fmt.Errorf("--metric-name-mode must be one of %q, %q", MetricNameModeMeasurementField, MetricNameModeField)
 	}
 	switch i.cfg.DuplicateTimestampPolicy {
 	case "error", "first":
@@ -326,6 +333,7 @@ func (i *Importer) copyWindow(ctx context.Context, schema []measurementSchema, s
 		lastSamples:     map[string]lastSample{},
 		staticLabels:    i.seriesLabels,
 		metricPrefix:    i.cfg.MetricPrefix,
+		metricNameMode:  i.cfg.MetricNameMode,
 		preserveSource:  i.cfg.PreserveSourceLabels,
 		duplicatePolicy: i.cfg.DuplicateTimestampPolicy,
 	}
@@ -377,6 +385,7 @@ type blockWindow struct {
 	lastSamples     map[string]lastSample
 	staticLabels    map[string]string
 	metricPrefix    string
+	metricNameMode  string
 	preserveSource  bool
 	duplicatePolicy string
 	samples         int64
@@ -425,7 +434,7 @@ func (b *blockWindow) appendResponse(measurement string, fieldByColumn map[strin
 					if !ok {
 						continue
 					}
-					name := metricName(b.metricPrefix, measurement, field.Key)
+					name := metricName(b.metricNameMode, b.metricPrefix, measurement, field.Key)
 					lset := buildLabels(name, measurement, field.Key, series.Tags, b.staticLabels, b.preserveSource)
 					key := lset.String()
 					if skip, err := b.handleDuplicate(key, ms, value); err != nil {
