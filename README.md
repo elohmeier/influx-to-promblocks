@@ -59,6 +59,7 @@ Useful flags:
 - `--retention-policy=autogen`: selects an InfluxDB retention policy.
 - `--parallelism=4`: copies multiple time windows concurrently. Start low and increase only while the source InfluxDB remains healthy.
 - `--max-fields-per-query=50`: selects more fields in each Influx query, reducing HTTP round trips when measurements have many numeric fields.
+- `--compact-output`: copies query-window blocks to a temporary directory first, then locally compacts them into `--block-duration` output blocks.
 - `--series-label=tenant=acme`: adds a static label to every generated Prometheus series.
 - `--output-dir=./out/prom-blocks`: sets the Prometheus block output directory.
 - `--metric-name-mode=field`: uses the Influx field name as the Prometheus metric name.
@@ -71,7 +72,8 @@ Most export time is usually spent waiting for Influx `SELECT` queries. Block wri
 
 Useful levers:
 
-- Use the largest `--window` that stays within `--block-duration` and does not make Influx responses too large. For example, `--window=48h --block-duration=48h` halves the number of windows compared with `--window=24h`.
+- Use `--compact-output` when you need large final blocks but Influx is faster with short queries. For example, `--window=24h --block-duration=12000h --compact-output --parallelism=10` runs 1-day Influx queries in parallel and then locally compacts them into one large output block for that range.
+- Without `--compact-output`, use the largest `--window` that stays within `--block-duration` and does not make Influx responses too large. For example, `--window=48h --block-duration=48h` halves the number of windows compared with `--window=24h`.
 - Use `--parallelism=N` to copy independent windows concurrently. Values like `2` or `4` are a reasonable starting point for backfills; higher values can overload the source InfluxDB.
 - Increase `--max-fields-per-query` when many fields are exported from the same measurement. This reduces per-window query count, but very wide queries can increase Influx memory use.
 - Tune `--chunk-size` upward only if the client is spending too much time decoding many small chunks and memory use remains acceptable.

@@ -18,6 +18,7 @@ import (
 
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/elohmeier/influx-to-promblocks/internal/influx"
 )
@@ -36,6 +37,7 @@ type Config struct {
 	ChunkSize                int
 	Parallelism              int
 	MaxFieldsPerQuery        int
+	CompactOutput            bool
 	IncludeBooleans          bool
 	MetricPrefix             string
 	MetricNameMode           string
@@ -116,10 +118,12 @@ func (i *Importer) Run(ctx context.Context) (Stats, error) {
 	i.logger.Info("schema discovered", "measurements", len(schema), "numeric_field_groups", countFields(schema))
 
 	windows := buildWindows(start, end, i.cfg.Window)
-	if i.cfg.Parallelism == 1 {
-		return i.copyWindowsSerial(ctx, schema, windows)
+	if i.cfg.CompactOutput {
+		return i.copyWindowsCompacted(ctx, schema, start, end)
 	}
-	return i.copyWindowsParallel(ctx, schema, windows)
+
+	stats, _, err := i.copyWindows(ctx, i.cfg.OutputDir, schema, windows)
+	return stats, err
 }
 
 func (i *Importer) validate() error {
@@ -176,8 +180,14 @@ type windowRange struct {
 }
 
 type windowResult struct {
+	block copiedBlock
 	stats Stats
 	err   error
+}
+
+type copiedBlock struct {
+	dir    string
+	window windowRange
 }
 
 func newHTTPClient(parallelism int) *http.Client {
@@ -203,19 +213,30 @@ func buildWindows(start, end time.Time, window time.Duration) []windowRange {
 	return windows
 }
 
-func (i *Importer) copyWindowsSerial(ctx context.Context, schema []measurementSchema, windows []windowRange) (Stats, error) {
-	var stats Stats
-	for _, window := range windows {
-		windowStats, err := i.copyWindow(ctx, schema, window.start, window.end)
-		if err != nil {
-			return stats, err
-		}
-		addWindowStats(&stats, windowStats)
+func (i *Importer) copyWindows(ctx context.Context, outputDir string, schema []measurementSchema, windows []windowRange) (Stats, []copiedBlock, error) {
+	if i.cfg.Parallelism == 1 {
+		return i.copyWindowsSerial(ctx, outputDir, schema, windows)
 	}
-	return stats, nil
+	return i.copyWindowsParallel(ctx, outputDir, schema, windows)
 }
 
-func (i *Importer) copyWindowsParallel(ctx context.Context, schema []measurementSchema, windows []windowRange) (Stats, error) {
+func (i *Importer) copyWindowsSerial(ctx context.Context, outputDir string, schema []measurementSchema, windows []windowRange) (Stats, []copiedBlock, error) {
+	var stats Stats
+	var blocks []copiedBlock
+	for _, window := range windows {
+		windowStats, blockDir, err := i.copyWindow(ctx, outputDir, schema, window.start, window.end)
+		if err != nil {
+			return stats, blocks, err
+		}
+		addWindowStats(&stats, windowStats)
+		if blockDir != "" {
+			blocks = append(blocks, copiedBlock{dir: blockDir, window: window})
+		}
+	}
+	return stats, blocks, nil
+}
+
+func (i *Importer) copyWindowsParallel(ctx context.Context, outputDir string, schema []measurementSchema, windows []windowRange) (Stats, []copiedBlock, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -237,13 +258,17 @@ func (i *Importer) copyWindowsParallel(ctx context.Context, schema []measurement
 				if ctx.Err() != nil {
 					return
 				}
-				windowStats, err := i.copyWindow(ctx, schema, window.start, window.end)
+				windowStats, blockDir, err := i.copyWindow(ctx, outputDir, schema, window.start, window.end)
 				if err != nil {
 					results <- windowResult{err: fmt.Errorf("copy window %s to %s: %w", window.start.Format(time.RFC3339), window.end.Format(time.RFC3339), err)}
 					cancel()
 					return
 				}
-				results <- windowResult{stats: windowStats}
+				result := windowResult{stats: windowStats}
+				if blockDir != "" {
+					result.block = copiedBlock{dir: blockDir, window: window}
+				}
+				results <- result
 			}
 		}()
 	}
@@ -265,6 +290,7 @@ func (i *Importer) copyWindowsParallel(ctx context.Context, schema []measurement
 	}()
 
 	var stats Stats
+	var blocks []copiedBlock
 	var firstErr error
 	for result := range results {
 		if result.err != nil {
@@ -274,8 +300,11 @@ func (i *Importer) copyWindowsParallel(ctx context.Context, schema []measurement
 			continue
 		}
 		addWindowStats(&stats, result.stats)
+		if result.block.dir != "" {
+			blocks = append(blocks, result.block)
+		}
 	}
-	return stats, firstErr
+	return stats, blocks, firstErr
 }
 
 func addWindowStats(total *Stats, window Stats) {
@@ -315,14 +344,169 @@ func (i *Importer) discoverSchema(ctx context.Context) ([]measurementSchema, err
 	return schema, nil
 }
 
-func (i *Importer) copyWindow(ctx context.Context, schema []measurementSchema, start, end time.Time) (Stats, error) {
-	if err := os.MkdirAll(i.cfg.OutputDir, 0o755); err != nil {
+func (i *Importer) copyWindowsCompacted(ctx context.Context, schema []measurementSchema, start, end time.Time) (Stats, error) {
+	tempDir, err := os.MkdirTemp(i.cfg.OutputDir, ".tmp-influx-to-promblocks-")
+	if err != nil {
+		return Stats{}, err
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			i.logger.Warn("failed to remove temporary block directory", "dir", tempDir, "err", err)
+		}
+	}()
+
+	finalWindows := buildWindows(start, end, i.cfg.BlockDuration)
+	queryWindows := buildQueryWindows(finalWindows, i.cfg.Window)
+	i.logger.Info(
+		"copying query windows before compaction",
+		"query_windows", len(queryWindows),
+		"final_block_windows", len(finalWindows),
+		"temporary_dir", tempDir,
+	)
+
+	stats, blocks, err := i.copyWindows(ctx, tempDir, schema, queryWindows)
+	if err != nil {
+		return stats, err
+	}
+	if len(blocks) == 0 {
+		i.logger.Info("no temporary blocks to compact")
+		return stats, nil
+	}
+
+	compactStats, err := i.compactCopiedBlocks(ctx, blocks, finalWindows)
+	if err != nil {
+		return stats, err
+	}
+	stats.Blocks = compactStats.Blocks
+	stats.Samples = compactStats.Samples
+	stats.Series = compactStats.Series
+	return stats, nil
+}
+
+func buildQueryWindows(finalWindows []windowRange, queryWindow time.Duration) []windowRange {
+	var queryWindows []windowRange
+	for _, finalWindow := range finalWindows {
+		queryWindows = append(queryWindows, buildWindows(finalWindow.start, finalWindow.end, queryWindow)...)
+	}
+	return queryWindows
+}
+
+type copiedBlockMeta struct {
+	block copiedBlock
+	meta  tsdb.BlockMeta
+}
+
+func (i *Importer) compactCopiedBlocks(ctx context.Context, blocks []copiedBlock, finalWindows []windowRange) (Stats, error) {
+	blockMetas := make([]copiedBlockMeta, 0, len(blocks))
+	for _, block := range blocks {
+		meta, err := readBlockMeta(block.dir)
+		if err != nil {
+			return Stats{}, err
+		}
+		blockMetas = append(blockMetas, copiedBlockMeta{block: block, meta: meta})
+	}
+
+	compactor, err := tsdb.NewLeveledCompactor(ctx, nil, i.logger, []int64{i.cfg.BlockDuration.Milliseconds()}, chunkenc.NewPool(), nil)
+	if err != nil {
 		return Stats{}, err
 	}
 
-	writer, err := tsdb.NewBlockWriter(i.logger, i.cfg.OutputDir, i.cfg.BlockDuration.Milliseconds())
+	var total Stats
+	for _, finalWindow := range finalWindows {
+		var group []copiedBlockMeta
+		for _, block := range blockMetas {
+			if !block.block.window.start.Before(finalWindow.start) && block.block.window.start.Before(finalWindow.end) {
+				group = append(group, block)
+			}
+		}
+		if len(group) == 0 {
+			continue
+		}
+
+		stats, err := i.compactBlockGroup(ctx, compactor, finalWindow, group)
+		if err != nil {
+			return total, err
+		}
+		total.Blocks += stats.Blocks
+		total.Samples += stats.Samples
+		if stats.Series > total.Series {
+			total.Series = stats.Series
+		}
+	}
+	return total, nil
+}
+
+func (i *Importer) compactBlockGroup(ctx context.Context, compactor tsdb.Compactor, finalWindow windowRange, group []copiedBlockMeta) (Stats, error) {
+	sort.Slice(group, func(a, b int) bool {
+		return group[a].meta.MinTime < group[b].meta.MinTime
+	})
+
+	dirs := make([]string, 0, len(group))
+	for _, block := range group {
+		dirs = append(dirs, block.block.dir)
+	}
+
+	i.logger.Info(
+		"compacting temporary blocks",
+		"blocks", len(dirs),
+		"start", finalWindow.start.Format(time.RFC3339),
+		"end", finalWindow.end.Format(time.RFC3339),
+	)
+
+	if len(dirs) == 1 {
+		finalDir := filepath.Join(i.cfg.OutputDir, filepath.Base(dirs[0]))
+		if err := os.Rename(dirs[0], finalDir); err != nil {
+			return Stats{}, err
+		}
+		meta := group[0].meta
+		i.logger.Info("moved single temporary block", "block", meta.ULID.String(), "samples", meta.Stats.NumSamples, "series", meta.Stats.NumSeries, "dir", finalDir)
+		return Stats{Blocks: 1, Samples: int64(meta.Stats.NumSamples), Series: int(meta.Stats.NumSeries)}, nil
+	}
+
+	ids, err := compactor.Compact(i.cfg.OutputDir, dirs, nil)
 	if err != nil {
 		return Stats{}, err
+	}
+
+	var stats Stats
+	for _, id := range ids {
+		bdir := filepath.Join(i.cfg.OutputDir, id.String())
+		meta, err := readBlockMeta(bdir)
+		if err != nil {
+			return stats, err
+		}
+		stats.Blocks++
+		stats.Samples += int64(meta.Stats.NumSamples)
+		if int(meta.Stats.NumSeries) > stats.Series {
+			stats.Series = int(meta.Stats.NumSeries)
+		}
+		i.logger.Info("wrote compacted block", "block", id.String(), "samples", meta.Stats.NumSamples, "series", meta.Stats.NumSeries, "dir", bdir)
+	}
+	return stats, nil
+}
+
+func readBlockMeta(dir string) (tsdb.BlockMeta, error) {
+	f, err := os.Open(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		return tsdb.BlockMeta{}, err
+	}
+	defer f.Close()
+
+	var meta tsdb.BlockMeta
+	if err := json.NewDecoder(f).Decode(&meta); err != nil {
+		return tsdb.BlockMeta{}, err
+	}
+	return meta, nil
+}
+
+func (i *Importer) copyWindow(ctx context.Context, outputDir string, schema []measurementSchema, start, end time.Time) (Stats, string, error) {
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return Stats{}, "", err
+	}
+
+	writer, err := tsdb.NewBlockWriter(i.logger, outputDir, i.cfg.BlockDuration.Milliseconds())
+	if err != nil {
+		return Stats{}, "", err
 	}
 	defer writer.Close()
 
@@ -349,33 +533,33 @@ func (i *Importer) copyWindow(ctx context.Context, schema []measurementSchema, s
 			if err := i.influx.Query(ctx, q, true, i.cfg.ChunkSize, func(resp influx.Response) error {
 				return bw.appendResponse(ms.Name, fieldByColumn, resp, i.cfg.IncludeBooleans)
 			}); err != nil {
-				return Stats{}, err
+				return Stats{}, "", err
 			}
 		}
 	}
 
 	if bw.samples == 0 {
 		i.logger.Info("window had no samples", "start", start.Format(time.RFC3339), "end", end.Format(time.RFC3339))
-		return Stats{}, nil
+		return Stats{}, "", nil
 	}
 	if err := bw.commit(); err != nil {
-		return Stats{}, err
+		return Stats{}, "", err
 	}
 	ulid, err := writer.Flush(ctx)
 	if err != nil {
 		if errors.Is(err, tsdb.ErrNoSeriesAppended) {
-			return Stats{}, nil
+			return Stats{}, "", nil
 		}
-		return Stats{}, err
+		return Stats{}, "", err
 	}
 	if ulid.String() == "00000000000000000000000000" {
-		return Stats{}, nil
+		return Stats{}, "", nil
 	}
 
 	stats := Stats{Blocks: 1, Samples: bw.samples, Series: len(bw.refs)}
-	bdir := filepath.Join(i.cfg.OutputDir, ulid.String())
+	bdir := filepath.Join(outputDir, ulid.String())
 	i.logger.Info("wrote local block", "block", ulid.String(), "samples", bw.samples, "series", len(bw.refs), "dir", bdir)
-	return stats, nil
+	return stats, bdir, nil
 }
 
 type blockWindow struct {

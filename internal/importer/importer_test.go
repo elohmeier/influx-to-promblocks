@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -82,6 +84,75 @@ func TestImporterCopiesWindowsInParallel(t *testing.T) {
 	}
 }
 
+func TestImporterCompactsParallelQueryWindowsIntoOneOutputBlock(t *testing.T) {
+	var inFlight int64
+	var maxInFlight int64
+	timeLowerBound := regexp.MustCompile(`time >= ([0-9]+)`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		q := r.Form.Get("q")
+		switch {
+		case strings.HasPrefix(q, "SHOW FIELD KEYS"):
+			_, _ = w.Write([]byte(`{"results":[{"series":[{"name":"cpu","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`))
+		case strings.HasPrefix(q, "SELECT"):
+			current := atomic.AddInt64(&inFlight, 1)
+			for {
+				previous := atomic.LoadInt64(&maxInFlight)
+				if current <= previous || atomic.CompareAndSwapInt64(&maxInFlight, previous, current) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt64(&inFlight, -1)
+
+			matches := timeLowerBound.FindStringSubmatch(q)
+			if len(matches) != 2 {
+				t.Fatalf("query did not contain lower time bound: %s", q)
+			}
+			_, _ = fmt.Fprintf(w, `{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[[%s,1]]}]}]}`, matches[1])
+		default:
+			t.Fatalf("unexpected query: %s", q)
+		}
+	}))
+	defer srv.Close()
+
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	outputDir := t.TempDir()
+	cfg := Config{
+		InfluxURL:                srv.URL,
+		Database:                 "db",
+		Measurements:             []string{"cpu"},
+		Start:                    start.Format(time.RFC3339),
+		End:                      start.Add(4 * time.Hour).Format(time.RFC3339),
+		Window:                   time.Hour,
+		BlockDuration:            4 * time.Hour,
+		ChunkSize:                10,
+		Parallelism:              2,
+		MaxFieldsPerQuery:        20,
+		CompactOutput:            true,
+		PreserveSourceLabels:     true,
+		DuplicateTimestampPolicy: "error",
+		OutputDir:                outputDir,
+	}
+
+	stats, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Windows != 4 || stats.Blocks != 1 || stats.Samples != 4 || stats.Series != 1 {
+		t.Fatalf("unexpected stats: %#v", stats)
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got < 2 {
+		t.Fatalf("max concurrent SELECT requests = %d, want at least 2", got)
+	}
+	if got := countBlockDirs(t, outputDir); got != 1 {
+		t.Fatalf("output block count = %d, want 1", got)
+	}
+}
+
 func TestValidateRejectsUnsupportedMetricNameMode(t *testing.T) {
 	cfg := Config{
 		Database:                 "db",
@@ -101,6 +172,25 @@ func TestValidateRejectsUnsupportedMetricNameMode(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--metric-name-mode") {
 		t.Fatalf("validate() error = %v, want metric-name-mode error", err)
 	}
+}
+
+func countBlockDirs(t *testing.T, dir string) int {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, entry.Name(), "meta.json")); err == nil {
+			count++
+		}
+	}
+	return count
 }
 
 func TestBlockWindowAppendResponseUsesFieldMetricNameMode(t *testing.T) {
